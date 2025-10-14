@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>カメラ録画 + 推論（WebGPU対応 / 自動ロード / Top-K）</title>
+  <title>カメラ録画 + 推論（WebGPU / Top-K / FPS・IPS・Latency）</title>
   <style>
     :root { --bg:#0f172a; --panel:#111827; --fg:#e5e7eb; --muted:#9ca3af; --accent:#38bdf8; }
     * { box-sizing: border-box; } html, body { height: 100%; }
@@ -41,7 +41,7 @@
     .prog > i { display:block; height:100%; width:0%; background: linear-gradient(90deg, #60a5fa, #22d3ee); }
     .topk-score { width:56px; text-align:right; font-variant-numeric: tabular-nums; color: var(--muted); font-size:12px; }
   </style>
-  <!-- ONNX Runtime Web（CDN）。社内ネットでブロックされる場合はローカル同梱して src を差し替えてください。 -->
+  <!-- ONNX Runtime Web（CDN） -->
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
 </head>
 <body>
@@ -124,6 +124,8 @@
         </label>
         <label class="hint"><input type="checkbox" id="smoothToggle" checked> スムージング(EMA)</label>
         <span class="pill" id="fpsLabel">FPS: --</span>
+        <span class="pill" id="latencyLabel">Infer: -- ms</span>
+        <span class="pill" id="ipsLabel">IPS: --</span>
       </div>
       <div class="grid" style="grid-template-columns: 1fr 1fr; gap:14px">
         <div>
@@ -152,6 +154,12 @@
     // ================== モデルの固定パス（Vercel public/ 直配信） ==================
     const MODEL_URL = '/models/multitask_web.onnx';
     const MAP_URL   = '/models/idx_to_cell.json';
+
+    // （WASMフォールバック時の高速化オプション：SIMD & Threads）
+    try {
+      ort.env.wasm.simd = true;
+      ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
+    } catch {}
 
     // ================== 既存のカメラ/録画部分 ==================
     const preview = document.getElementById('preview');
@@ -281,14 +289,6 @@
       const sum = exps.reduce((a,b)=>a+b,0);
       return exps.map(v=>v/sum);
     }
-    // Top-K（logit配列から上位Kの index を返し、最後に確率化）
-    function topkProbs(logits, k){
-      const idx = [...logits.keys()].sort((a,b)=> logits[b]-logits[a]).slice(0, k);
-      const max = Math.max(...idx.map(i=>logits[i]));
-      const exps = idx.map(i => Math.exp(logits[i]-max));
-      const sum = exps.reduce((a,b)=>a+b,0);
-      return idx.map((i, t)=> ({i, p: exps[t]/sum}));
-    }
     function renderTopK(containerEl, items, labelFromIndex){
       containerEl.innerHTML = '';
       for (const {i, p} of items){
@@ -304,11 +304,15 @@
       }
     }
 
-    // ---------- スムージング & FPS ----------
+    // ---------- スムージング & FPS/IPS/Latency ----------
     let emaCell = null, emaLook = null;
     const EMA_ALPHA = 0.6; // 0.3～0.8で調整可
     let lastT = performance.now(), fpsAccum = 0, fpsCount = 0;
     const fpsLabel = document.getElementById('fpsLabel');
+    const latencyLabel = document.getElementById('latencyLabel');
+    const ipsLabel = document.getElementById('ipsLabel');
+    let inferMsAccum = 0, inferCnt = 0, lastStatTs = performance.now();
+
     const topKSelect = document.getElementById('topKSelect');
     const smoothToggle = document.getElementById('smoothToggle');
     const topkCellEl = document.getElementById('topkCell');
@@ -358,7 +362,7 @@
     async function runOnce(){
       if (!session || !idxToCell || !preview.videoWidth) return;
 
-      // FPS
+      // ループ周期FPS
       const now = performance.now();
       const dt = now - lastT; lastT = now;
       const instFPS = 1000 / Math.max(1, dt);
@@ -372,13 +376,26 @@
       const input = preprocessFromVideo(preview);
       const tensor = new ort.Tensor('float32', input, [1,3,IMG_H,IMG_W]);
 
-      // 推論
+      // 推論（レイテンシ計測）
+      const t0 = performance.now();
       const outputs = await session.run({ images: tensor });
+      const inferMs = performance.now() - t0;
+      inferMsAccum += inferMs; inferCnt++;
+
+      // 1秒ごとにIPS/Latency更新
+      if (now - lastStatTs >= 1000){
+        const avgMs = inferCnt ? (inferMsAccum / inferCnt) : 0;
+        const ips = inferCnt;
+        latencyLabel.textContent = `Infer: ${avgMs.toFixed(1)} ms`;
+        ipsLabel.textContent = `IPS: ${ips.toFixed(1)}`;
+        inferMsAccum = 0; inferCnt = 0; lastStatTs = now;
+      }
+
+      // 以降：確率化→スムージング→Top-K描画
       const vals = Object.values(outputs);
       const cell = outputs.cell_logits ?? vals[0];
       const look = outputs.look_logits ?? vals[1];
 
-      // ロジット→確率（全クラス）
       function toProbs(logits){
         const max = Math.max(...logits);
         const exps = logits.map(v=>Math.exp(v-max));
@@ -388,27 +405,23 @@
       let pCell = toProbs(Array.from(cell.data));
       let pLook = toProbs(Array.from(look.data));
 
-      // スムージング
       if (smoothToggle.checked){
         if (!emaCell) emaCell = pCell.slice();
         if (!emaLook) emaLook = pLook.slice();
         for (let i=0;i<pCell.length;i++){
-          emaCell[i] = EMA_ALPHA*pCell[i] + (1-EMA_ALPHA)*emaCell[i];
-          emaLook[i] = EMA_ALPHA*pLook[i] + (1-EMA_ALPHA)*emaLook[i];
+          emaCell[i] = 0.6*pCell[i] + 0.4*emaCell[i];
+          emaLook[i] = 0.6*pLook[i] + 0.4*emaLook[i];
         }
         pCell = emaCell; pLook = emaLook;
       }
 
-      // Top-K
       const K = parseInt(topKSelect.value || '5', 10);
       const idxC = [...pCell.keys()].sort((a,b)=> pCell[b]-pCell[a]).slice(0, K).map(i=>({i, p:pCell[i]}));
       const idxL = [...pLook.keys()].sort((a,b)=> pLook[b]-pLook[a]).slice(0, K).map(i=>({i, p:pLook[i]}));
 
-      // 描画（Top-K）
       renderTopK(topkCellEl, idxC, labelFromIndex);
       renderTopK(topkLookEl, idxL, labelFromIndex);
 
-      // オーバレイ（Top1の簡易表示）
       const bestC = idxC[0], bestL = idxL[0];
       overlayInfo.style.display = 'block';
       overlayInfo.innerHTML = `
@@ -422,7 +435,7 @@
       if (!stream){ alert('先にカメラを開始してください'); return; }
       inferStatusEl.textContent = '推論中…';
       inferStartBtn.disabled = true; inferStopBtn.disabled = false;
-      // 約 ~10fps（必要なら 50–150ms で調整）
+      // 100ms間隔 ≒ 最大10回/秒（必要なら 60ms などに調整可）
       inferTimer = setInterval(runOnce, 100);
     }
     function stopInferLoop(){
@@ -436,7 +449,9 @@
     stopBtn.addEventListener('click', stopInferLoop);
 
     // ページ読み込み時に自動ロード
-    window.addEventListener('DOMContentLoaded', autoLoadModelAndMap);
+    window.addEventListener('DOMContentLoaded', async () => {
+      await autoLoadModelAndMap();
+    });
   </script>
 </body>
 </html>
