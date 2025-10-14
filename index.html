@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>カメラ録画ミニアプリ（PC & iPhone対応）</title>
+  <style>
+    :root { --bg:#0f172a; --panel:#111827; --fg:#e5e7eb; --muted:#9ca3af; --accent:#38bdf8; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; background: var(--bg); color: var(--fg); }
+    .wrap { max-width: 960px; margin: 0 auto; padding: 20px; }
+    header { display:flex; justify-content: space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+    h1 { font-size: clamp(20px, 4.5vw, 28px); margin: 0; letter-spacing: .02em; }
+    .hint { color: var(--muted); font-size: 13px; }
+    .panel { background: var(--panel); border: 1px solid #1f2937; border-radius: 16px; padding: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+    @media (min-width: 900px){ .grid { grid-template-columns: 1.2fr .8fr; } }
+
+    video, .recorded { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 14px; overflow: hidden; display: block; }
+    video { object-fit: cover; }
+    .controls { display:flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    select, button, input[type="checkbox"] { font: inherit; }
+    select, button { border-radius: 12px; border: 1px solid #334155; padding: 10px 14px; background: #0b1220; color: var(--fg); cursor: pointer; }
+    button[disabled] { opacity: .45; cursor: not-allowed; }
+    button.primary { background: linear-gradient(180deg, #1e293b, #0b1220); border-color: #3b82f6; }
+    button.danger { border-color: #ef4444; }
+    .row { display:flex; gap: 10px; align-items:center; flex-wrap: wrap; }
+    .pill { padding: 6px 10px; border-radius: 999px; border:1px solid #334155; font-size: 12px; color: var(--muted); }
+    .status { font-size: 13px; color: var(--muted); }
+    .blink { animation: blink 1s steps(2, start) infinite; }
+    @keyframes blink { to { visibility: hidden; } }
+    a.dl { display:inline-block; margin-top: 8px; color: white; text-decoration: none; border:1px solid #334155; border-radius: 10px; padding: 8px 12px; }
+    .note { font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .chip { display:inline-flex; align-items:center; gap:6px; background:#0b1220; border:1px solid #334155; border-radius:999px; padding:6px 10px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>📹 カメラ録画ミニアプリ</h1>
+      <div class="chip" title="接続は必ずHTTPSで">🔒 HTTPS 推奨</div>
+    </header>
+
+    <div class="grid">
+      <section class="panel">
+        <div class="row" style="justify-content: space-between;">
+          <div class="row">
+            <label for="cameraSelect" class="hint">カメラ</label>
+            <select id="cameraSelect" title="使用するカメラ">
+              <option value="environment">背面（環境）</option>
+              <option value="user">前面（自撮り）</option>
+              <option value="auto">自動</option>
+            </select>
+          </div>
+          <div class="row">
+            <label class="hint"><input type="checkbox" id="micToggle" checked /> マイクON</label>
+            <label class="hint"><input type="checkbox" id="hdToggle" /> 高画質(1080pを試行)</label>
+          </div>
+        </div>
+
+        <video id="preview" playsinline muted autoplay></video>
+
+        <div class="controls">
+          <button id="startBtn" class="primary">カメラ開始</button>
+          <button id="stopBtn" class="danger" disabled>カメラ停止</button>
+          <span class="pill" id="liveLabel">LIVEプレビュー</span>
+        </div>
+        <p class="status" id="status"></p>
+      </section>
+
+      <section class="panel">
+        <h3 style="margin-top:0">🎞️ 録画</h3>
+        <div class="controls">
+          <button id="recBtn" disabled>録画開始</button>
+          <button id="stopRecBtn" class="danger" disabled>録画停止</button>
+          <span class="status" id="recStatus">待機中</span>
+        </div>
+        <video id="playback" class="recorded" controls playsinline></video>
+        <a id="download" class="dl" href="#" download style="display:none">保存する</a>
+        <p class="note">
+          iPhone / iPad では iOS 14.3 以降で <code>MediaRecorder</code> が動作します。古い端末では録画は非対応です。<br>
+          Safari / iOS では <b>https</b> 接続かローカル（<code>localhost</code>）でのみカメラが有効になります。
+        </p>
+      </section>
+    </div>
+
+    <details style="margin-top:18px;" class="panel">
+      <summary>トラブル対処のヒント</summary>
+      <ul class="note">
+        <li>カメラが真っ黒 → サイトがHTTPSであること、または <code>localhost</code> で開いていることを確認。</li>
+        <li>自動再生されない → ボタンを一度押してユーザー操作のジェスチャーを発生させてください。</li>
+        <li>背面カメラに切り替わらない → 端末に背面カメラがない／権限が拒否されている可能性。</li>
+      </ul>
+    </details>
+  </div>
+
+  <script>
+    const preview = document.getElementById('preview');
+    const playback = document.getElementById('playback');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const recBtn = document.getElementById('recBtn');
+    const stopRecBtn = document.getElementById('stopRecBtn');
+    const statusEl = document.getElementById('status');
+    const recStatusEl = document.getElementById('recStatus');
+    const cameraSelect = document.getElementById('cameraSelect');
+    const micToggle = document.getElementById('micToggle');
+    const hdToggle = document.getElementById('hdToggle');
+    const downloadLink = document.getElementById('download');
+
+    let stream = null;
+    let recorder = null;
+    let chunks = [];
+    let chosenMime = '';
+
+    function pickMimeType(){
+      const candidates = [
+        'video/mp4;codecs=h264,aac', // Safari系
+        'video/mp4;codecs=avc1',
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm'
+      ];
+      for (const mime of candidates){
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(mime)){
+          return mime;
+        }
+      }
+      return '';
+    }
+
+    async function startCamera(){
+      try{
+        // 停止中のトラックをクリーンアップ
+        stopCamera();
+
+        const facing = cameraSelect.value;
+        const useMic = micToggle.checked;
+        const hd = hdToggle.checked;
+
+        const videoConstraints = { 
+          width: hd ? { ideal: 1920 } : { ideal: 1280 },
+          height: hd ? { ideal: 1080 } : { ideal: 720 },
+          frameRate: { ideal: 30, max: 60 },
+        };
+        if (facing === 'environment') videoConstraints.facingMode = { ideal: 'environment' };
+        else if (facing === 'user') videoConstraints.facingMode = { ideal: 'user' };
+
+        stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: useMic });
+        preview.srcObject = stream;
+        await preview.play();
+
+        statusEl.textContent = 'カメラ起動中';
+        startBtn.disabled = true; stopBtn.disabled = false; recBtn.disabled = false;
+      } catch(err){
+        console.error(err);
+        statusEl.textContent = 'カメラを開始できませんでした：' + (err.message || err.name);
+        startBtn.disabled = false; stopBtn.disabled = true; recBtn.disabled = true;
+      }
+    }
+
+    function stopCamera(){
+      if (stream){
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      preview.srcObject = null;
+      startBtn.disabled = false; stopBtn.disabled = true; recBtn.disabled = true;
+      statusEl.textContent = '停止中';
+    }
+
+    function startRecording(){
+      if (!stream){
+        alert('先にカメラを開始してください');
+        return;
+      }
+      chunks = [];
+      chosenMime = pickMimeType();
+      try{
+        recorder = new MediaRecorder(stream, chosenMime ? { mimeType: chosenMime } : undefined);
+      } catch (e){
+        console.warn('MediaRecorder作成に失敗:', e);
+        alert('このブラウザでは録画がサポートされていない可能性があります。');
+        return;
+      }
+
+      recorder.ondataavailable = (e)=>{ if (e.data && e.data.size) chunks.push(e.data); };
+      recorder.onstop = handleRecordingStop;
+      recorder.start();
+
+      recBtn.disabled = true; stopRecBtn.disabled = false; recStatusEl.textContent = '録画中…'; recStatusEl.classList.add('blink');
+    }
+
+    function stopRecording(){
+      if (recorder && recorder.state !== 'inactive'){
+        recorder.stop();
+      }
+      stopRecBtn.disabled = true; recBtn.disabled = false; recStatusEl.textContent = '処理中…';
+    }
+
+    function handleRecordingStop(){
+      const blob = new Blob(chunks, { type: chosenMime || 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      playback.src = url;
+      playback.load();
+      playback.play();
+
+      const ext = (chosenMime && chosenMime.includes('mp4')) ? 'mp4' : 'webm';
+      const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+      downloadLink.href = url;
+      downloadLink.download = `recording-${stamp}.${ext}`;
+      downloadLink.style.display = 'inline-block';
+
+      recStatusEl.textContent = '録画完了';
+      recStatusEl.classList.remove('blink');
+    }
+
+    // UI events
+    startBtn.addEventListener('click', startCamera);
+    stopBtn.addEventListener('click', stopCamera);
+    recBtn.addEventListener('click', startRecording);
+    stopRecBtn.addEventListener('click', stopRecording);
+
+    // 録画ボタンの状態更新（カメラ設定変更時）
+    [cameraSelect, micToggle, hdToggle].forEach(el => el.addEventListener('change', ()=>{
+      if (stream){
+        // 反映のため再起動を促す
+        statusEl.textContent = '設定が変更されました。再度「カメラ開始」を押してください。';
+      }
+    }));
+
+    // iOSでの自動再生互換のための属性
+    preview.setAttribute('playsinline', 'true');
+    playback.setAttribute('playsinline', 'true');
+
+    // 権限チェック（任意）
+    if (!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
+      statusEl.textContent = 'このブラウザはカメラアクセスに対応していません。最新のChrome / Safari / Edge / Firefoxでお試しください。';
+      startBtn.disabled = true;
+    }
+  </script>
+</body>
+</html>
