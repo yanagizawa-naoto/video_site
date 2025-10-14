@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>カメラ録画 + 推論（WebGPU対応）</title>
+  <title>カメラ録画 + 推論（WebGPU対応 / 自動ロード）</title>
   <style>
     :root { --bg:#0f172a; --panel:#111827; --fg:#e5e7eb; --muted:#9ca3af; --accent:#38bdf8; }
     * { box-sizing: border-box; } html, body { height: 100%; }
@@ -19,7 +19,7 @@
     video, .recorded { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 14px; overflow: hidden; display: block; object-fit: cover; }
     .controls { display:flex; flex-wrap: wrap; gap: 10px; align-items: center; }
     select, button, input[type="checkbox"] { font: inherit; }
-    select, button, input[type="file"] { border-radius: 12px; border: 1px solid #334155; padding: 10px 14px; background: #0b1220; color: var(--fg); }
+    select, button { border-radius: 12px; border: 1px solid #334155; padding: 10px 14px; background: #0b1220; color: var(--fg); }
     button { cursor: pointer; } button[disabled]{ opacity:.45; cursor:not-allowed; }
     button.primary { background: linear-gradient(180deg, #1e293b, #0b1220); border-color: #3b82f6; }
     button.danger  { border-color: #ef4444; }
@@ -34,13 +34,13 @@
     .stack { position:relative; }
     .backend { font-size: 12px; color: var(--muted); }
   </style>
-  <!-- ONNX Runtime Web（CDN）。バージョン固定を推奨（例: 1.20.0）。ネット不可環境なら同梱してください。 -->
+  <!-- ONNX Runtime Web（CDN） -->
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
 </head>
 <body>
   <div class="wrap">
     <header>
-      <h1>📹 カメラ録画 + 推論（WebGPU対応）</h1>
+      <h1>📹 カメラ録画 + 推論（WebGPU / 自動ロード）</h1>
       <div class="chip" title="接続は必ずHTTPSで">🔒 HTTPS 推奨</div>
     </header>
 
@@ -92,20 +92,15 @@
 
         <hr style="border-color:#334155">
 
-        <h3 style="margin:6px 0 8px">🧠 推論（WebGPU / WASM）</h3>
-        <div class="controls" style="gap:8px">
-          <input type="file" id="onnxFile" accept=".onnx" />
-          <input type="file" id="mapFile" accept=".json" title="idx_to_cell.json" />
-          <button id="loadModelBtn">モデル読み込み</button>
-        </div>
+        <h3 style="margin:6px 0 8px">🧠 推論（自動ロード）</h3>
         <div class="controls">
           <button id="inferStartBtn" disabled>推論開始</button>
           <button id="inferStopBtn" class="danger" disabled>推論停止</button>
-          <span class="status" id="inferStatus">モデル未ロード</span>
+          <span class="status" id="inferStatus">モデル読み込み中…</span>
         </div>
         <ul class="note" style="margin-top:8px">
-          <li>エクスポート名：<code>multitask_web.onnx</code>（出力名 <code>cell_logits</code>, <code>look_logits</code>）</li>
-          <li>マッピング：<code>idx_to_cell.json</code>（インデックス → <code>[gx, gy]</code> の配列）</li>
+          <li>読み込み先：<code>/models/multitask_web.onnx</code> / <code>/models/idx_to_cell.json</code></li>
+          <li>バックエンド：WebGPU→WASMに自動フォールバック</li>
         </ul>
       </section>
     </div>
@@ -121,7 +116,11 @@
   </div>
 
   <script>
-    // ====== 既存のカメラ/録画部分 ======
+    // ================== モデルの固定パス（Vercel の public/ 直配信） ==================
+    const MODEL_URL = '/models/multitask_web.onnx';
+    const MAP_URL   = '/models/idx_to_cell.json';
+
+    // ================== 既存のカメラ/録画部分 ==================
     const preview = document.getElementById('preview');
     const playback = document.getElementById('playback');
     const startBtn = document.getElementById('startBtn');
@@ -210,10 +209,7 @@
       statusEl.textContent='このブラウザはカメラアクセス非対応です。'; startBtn.disabled=true;
     }
 
-    // ====== 推論（ONNX Runtime Web） ======
-    const onnxFile = document.getElementById('onnxFile');
-    const mapFile  = document.getElementById('mapFile');
-    const loadModelBtn = document.getElementById('loadModelBtn');
+    // ================== 推論（ONNX Runtime Web） ==================
     const inferStartBtn = document.getElementById('inferStartBtn');
     const inferStopBtn  = document.getElementById('inferStopBtn');
     const inferStatusEl = document.getElementById('inferStatus');
@@ -223,27 +219,22 @@
     const IMG_H = 189, IMG_W = 252;
     const MEAN = [0.485,0.456,0.406], STD=[0.229,0.224,0.225];
 
-    // 取り込み用のオフスクリーンCanvas
-    const off = document.createElement('canvas');
-    off.width = IMG_W; off.height = IMG_H;
+    const off = document.createElement('canvas'); off.width = IMG_W; off.height = IMG_H;
     const offctx = off.getContext('2d', {willReadFrequently:true});
 
-    // バックエンド選択（WebGPU → WASM）
-    async function createSession(modelArrayBuffer){
-      // WebGPUが使えれば優先
+    async function createSessionFromUrl(url){
       let ep = 'webgpu';
       if (!('gpu' in navigator)) ep = 'wasm';
       try{
         backendLabel.textContent = `EP: ${ep}`;
-        return await ort.InferenceSession.create(modelArrayBuffer, {
+        return await ort.InferenceSession.create(url, {
           executionProviders: [ep],
-          // WebGPU メモ: Chrome/Edge 最新版推奨。iOS/SafariはWASMに落ちる場合あり
           graphOptimizationLevel: 'all'
         });
       }catch(e){
         console.warn('WebGPU起動失敗、WASMへフォールバックします。', e);
         backendLabel.textContent = 'EP: wasm';
-        return await ort.InferenceSession.create(modelArrayBuffer, {
+        return await ort.InferenceSession.create(url, {
           executionProviders: ['wasm'],
           graphOptimizationLevel: 'all'
         });
@@ -256,15 +247,12 @@
       const sum = exps.reduce((a,b)=>a+b,0);
       return exps.map(v=>v/sum);
     }
-
     function top1(logits){
       let mi = 0, mv = -Infinity;
       for (let i=0;i<logits.length;i++){ if (logits[i] > mv){ mv = logits[i]; mi = i; } }
       return [mi, mv];
     }
-
     function preprocessFromVideo(video){
-      // videoフレーム → 189x252 → CHW float32 正規化
       offctx.drawImage(video, 0, 0, IMG_W, IMG_H);
       const im = offctx.getImageData(0, 0, IMG_W, IMG_H).data; // RGBA
       const out = new Float32Array(1*3*IMG_H*IMG_W);
@@ -274,44 +262,37 @@
           const si = (y*IMG_W + x)*4;
           const r = im[si]/255, g=im[si+1]/255, b=im[si+2]/255;
           const i0 = y*IMG_W + x;
-          out[i0] = (r - MEAN[0]) / STD[0];                // C0
-          out[strideC + i0] = (g - MEAN[1]) / STD[1];      // C1
-          out[strideC*2 + i0] = (b - MEAN[2]) / STD[2];    // C2
+          out[i0] = (r - MEAN[0]) / STD[0];
+          out[strideC + i0] = (g - MEAN[1]) / STD[1];
+          out[strideC*2 + i0] = (b - MEAN[2]) / STD[2];
         }
       }
-      return out; // shape: [1,3,H,W]
+      return out;
     }
 
-    async function loadModelAndMap(){
+    async function autoLoadModelAndMap(){
       try{
-        if (!onnxFile.files[0]){ alert('ONNXファイルを選択してください'); return; }
-        if (!mapFile.files[0]){ alert('idx_to_cell.json を選択してください'); return; }
+        const resp = await fetch(MAP_URL, {cache: 'no-cache'});
+        if (!resp.ok) throw new Error(`map fetch failed: ${resp.status}`);
+        idxToCell = await resp.json(); // [[gx,gy], ...]
 
-        const [modelBuf, mapText] = await Promise.all([
-          onnxFile.files[0].arrayBuffer(),
-          mapFile.files[0].text()
-        ]);
-        idxToCell = JSON.parse(mapText); // [[gx,gy], ...]
+        session = await createSessionFromUrl(MODEL_URL);
 
-        session = await createSession(modelBuf);
         inferStatusEl.textContent = `モデル読込完了（cells=${idxToCell.length}）`;
         inferStartBtn.disabled = false;
       }catch(e){
         console.error(e);
         inferStatusEl.textContent = 'モデル読込失敗: ' + (e.message||e);
+        inferStartBtn.disabled = true;
       }
     }
 
     let inferTimer = null;
     async function runOnce(){
       if (!session || !idxToCell || !preview.videoWidth) return;
-
       const input = preprocessFromVideo(preview);
       const tensor = new ort.Tensor('float32', input, [1,3,IMG_H,IMG_W]);
-
-      // 出力名は export 時のものに合わせる（cell_logits, look_logits）
       const outputs = await session.run({ images: tensor });
-      // 名前が違う場合に備え、values順にも対応
       const vals = Object.values(outputs);
       const cell = outputs.cell_logits ?? vals[0];
       const look = outputs.look_logits ?? vals[1];
@@ -319,11 +300,12 @@
       const cellLogits = Array.from(cell.data);
       const lookLogits = Array.from(look.data);
 
-      const [cellIdx, cellScore] = top1(cellLogits);
-      const [lookIdx, lookScore] = top1(lookLogits);
+      const [cellIdx] = top1(cellLogits);
+      const [lookIdx] = top1(lookLogits);
 
-      const [gxC, gyC]   = idxToCell[cellIdx] || ['?','?'];
-      const [gxL, gyL]   = idxToCell[lookIdx] || ['?','?'];
+      const [gxC, gyC] = idxToCell[cellIdx] || ['?','?'];
+      const [gxL, gyL] = idxToCell[lookIdx] || ['?','?'];
+
       const pCell = softmax(cellLogits)[cellIdx];
       const pLook = softmax(lookLogits)[lookIdx];
 
@@ -333,27 +315,24 @@
         <div><b>向き先セル</b>: #${lookIdx} (gx=${gxL}, gy=${gyL})  <span class="hint">p=${pLook.toFixed(3)}</span></div>
       `;
     }
-
     function startInferLoop(){
-      if (!session){ alert('モデルを読み込んでください'); return; }
+      if (!session){ alert('モデルが読み込まれていません'); return; }
       if (!stream){ alert('先にカメラを開始してください'); return; }
       inferStatusEl.textContent = '推論中…';
       inferStartBtn.disabled = true; inferStopBtn.disabled = false;
-      // だいたい ~10fps で回す（必要なら requestAnimationFrame に変更）
-      inferTimer = setInterval(runOnce, 100);
+      inferTimer = setInterval(runOnce, 100); // 約10fps
     }
     function stopInferLoop(){
       inferStartBtn.disabled = false; inferStopBtn.disabled = true;
       inferStatusEl.textContent = '停止中';
       if (inferTimer){ clearInterval(inferTimer); inferTimer=null; }
     }
-
-    loadModelBtn.addEventListener('click', loadModelAndMap);
     inferStartBtn.addEventListener('click', startInferLoop);
     inferStopBtn.addEventListener('click', stopInferLoop);
-
-    // カメラ停止時は推論も止める
     stopBtn.addEventListener('click', stopInferLoop);
+
+    // ページ読み込み時に自動ロード
+    window.addEventListener('DOMContentLoaded', autoLoadModelAndMap);
   </script>
 </body>
 </html>
