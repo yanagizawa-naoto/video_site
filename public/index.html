@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>カメラ録画 + 推論（WebGPU対応 / 自動ロード）</title>
+  <title>カメラ録画 + 推論（WebGPU対応 / 自動ロード / Top-K）</title>
   <style>
     :root { --bg:#0f172a; --panel:#111827; --fg:#e5e7eb; --muted:#9ca3af; --accent:#38bdf8; }
     * { box-sizing: border-box; } html, body { height: 100%; }
@@ -33,14 +33,21 @@
     .overlay { position:absolute; top:10px; left:10px; background:rgba(0,0,0,.45); padding:8px 10px; border-radius:10px; font-size:12px; }
     .stack { position:relative; }
     .backend { font-size: 12px; color: var(--muted); }
+
+    /* Top-K 可視化 */
+    .topk-item { display:flex; align-items:center; gap:8px; margin:6px 0; }
+    .topk-label { min-width: 140px; font-size: 12px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .prog { flex:1; height: 8px; background:#1f2937; border-radius:999px; overflow:hidden; }
+    .prog > i { display:block; height:100%; width:0%; background: linear-gradient(90deg, #60a5fa, #22d3ee); }
+    .topk-score { width:56px; text-align:right; font-variant-numeric: tabular-nums; color: var(--muted); font-size:12px; }
   </style>
-  <!-- ONNX Runtime Web（CDN） -->
+  <!-- ONNX Runtime Web（CDN）。社内ネットでブロックされる場合はローカル同梱して src を差し替えてください。 -->
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
 </head>
 <body>
   <div class="wrap">
     <header>
-      <h1>📹 カメラ録画 + 推論（WebGPU / 自動ロード）</h1>
+      <h1>📹 カメラ録画 + 推論（WebGPU / Top-K 可視化）</h1>
       <div class="chip" title="接続は必ずHTTPSで">🔒 HTTPS 推奨</div>
     </header>
 
@@ -76,7 +83,7 @@
         <p class="status" id="status"></p>
       </section>
 
-      <!-- 右：録画 + 推論 -->
+      <!-- 右：録画 -->
       <section class="panel">
         <h3 style="margin-top:0">🎞️ 録画</h3>
         <div class="controls">
@@ -92,6 +99,7 @@
 
         <hr style="border-color:#334155">
 
+        <!-- 推論：自動ロード＆制御 -->
         <h3 style="margin:6px 0 8px">🧠 推論（自動ロード）</h3>
         <div class="controls">
           <button id="inferStartBtn" disabled>推論開始</button>
@@ -105,18 +113,43 @@
       </section>
     </div>
 
+    <!-- ✅ リアルタイムTop-K結果パネル -->
+    <section class="panel" id="realtimePanel" style="margin-top:16px">
+      <h3 style="margin:0 0 8px;">📊 リアルタイム予測</h3>
+      <div class="row" style="gap:12px;margin-bottom:8px;">
+        <label class="hint">Top-K
+          <select id="topKSelect">
+            <option>3</option><option selected>5</option><option>10</option>
+          </select>
+        </label>
+        <label class="hint"><input type="checkbox" id="smoothToggle" checked> スムージング(EMA)</label>
+        <span class="pill" id="fpsLabel">FPS: --</span>
+      </div>
+      <div class="grid" style="grid-template-columns: 1fr 1fr; gap:14px">
+        <div>
+          <div class="hint" style="margin-bottom:6px">現在セル（cell head）</div>
+          <div id="topkCell"></div>
+        </div>
+        <div>
+          <div class="hint" style="margin-bottom:6px">向き先セル（look head）</div>
+          <div id="topkLook"></div>
+        </div>
+      </div>
+    </section>
+
     <details style="margin-top:18px;" class="panel">
       <summary>トラブル対処のヒント</summary>
       <ul class="note">
-        <li>カメラが真っ黒 → HTTPS または <code>localhost</code> で開く。</li>
+        <li>トップが 404 → Vercel の Output Directory を見直し（<code>public</code> 推奨）。</li>
+        <li>モデル 404 → <code>public/models/...</code> に配置＆パスは <code>/models/...</code>。</li>
+        <li>WebGPU不可 → 自動で WASM にフォールバック（速度は低下）。</li>
         <li>自動再生されない → いずれかのボタンを押してジェスチャーを発生。</li>
-        <li>WebGPU不可 → 自動で WASM にフォールバックします（速度は低下）。</li>
       </ul>
     </details>
   </div>
 
   <script>
-    // ================== モデルの固定パス（Vercel の public/ 直配信） ==================
+    // ================== モデルの固定パス（Vercel public/ 直配信） ==================
     const MODEL_URL = '/models/multitask_web.onnx';
     const MAP_URL   = '/models/idx_to_cell.json';
 
@@ -241,17 +274,51 @@
       }
     }
 
+    // ---------- 可視化ユーティリティ ----------
     function softmax(logits){
       const max = Math.max(...logits);
       const exps = logits.map(v=>Math.exp(v - max));
       const sum = exps.reduce((a,b)=>a+b,0);
       return exps.map(v=>v/sum);
     }
-    function top1(logits){
-      let mi = 0, mv = -Infinity;
-      for (let i=0;i<logits.length;i++){ if (logits[i] > mv){ mv = logits[i]; mi = i; } }
-      return [mi, mv];
+    // Top-K（logit配列から上位Kの index を返し、最後に確率化）
+    function topkProbs(logits, k){
+      const idx = [...logits.keys()].sort((a,b)=> logits[b]-logits[a]).slice(0, k);
+      const max = Math.max(...idx.map(i=>logits[i]));
+      const exps = idx.map(i => Math.exp(logits[i]-max));
+      const sum = exps.reduce((a,b)=>a+b,0);
+      return idx.map((i, t)=> ({i, p: exps[t]/sum}));
     }
+    function renderTopK(containerEl, items, labelFromIndex){
+      containerEl.innerHTML = '';
+      for (const {i, p} of items){
+        const wrap = document.createElement('div'); wrap.className = 'topk-item';
+        const lb = document.createElement('div'); lb.className='topk-label';
+        lb.textContent = `${labelFromIndex(i)}`;
+        const prog = document.createElement('div'); prog.className='prog';
+        const bar = document.createElement('i'); bar.style.width = `${(p*100).toFixed(1)}%`;
+        prog.appendChild(bar);
+        const sc = document.createElement('div'); sc.className='topk-score'; sc.textContent = (p*100).toFixed(1)+'%';
+        wrap.append(lb, prog, sc);
+        containerEl.appendChild(wrap);
+      }
+    }
+
+    // ---------- スムージング & FPS ----------
+    let emaCell = null, emaLook = null;
+    const EMA_ALPHA = 0.6; // 0.3～0.8で調整可
+    let lastT = performance.now(), fpsAccum = 0, fpsCount = 0;
+    const fpsLabel = document.getElementById('fpsLabel');
+    const topKSelect = document.getElementById('topKSelect');
+    const smoothToggle = document.getElementById('smoothToggle');
+    const topkCellEl = document.getElementById('topkCell');
+    const topkLookEl = document.getElementById('topkLook');
+
+    function labelFromIndex(i){
+      const [gx, gy] = idxToCell[i] || ['?','?'];
+      return `#${i} (gx=${gx}, gy=${gy})`;
+    }
+
     function preprocessFromVideo(video){
       offctx.drawImage(video, 0, 0, IMG_W, IMG_H);
       const im = offctx.getImageData(0, 0, IMG_W, IMG_H).data; // RGBA
@@ -290,43 +357,80 @@
     let inferTimer = null;
     async function runOnce(){
       if (!session || !idxToCell || !preview.videoWidth) return;
+
+      // FPS
+      const now = performance.now();
+      const dt = now - lastT; lastT = now;
+      const instFPS = 1000 / Math.max(1, dt);
+      fpsAccum += instFPS; fpsCount++;
+      if (fpsCount >= 10){
+        fpsLabel.textContent = 'FPS: ' + (fpsAccum/fpsCount).toFixed(1);
+        fpsAccum = 0; fpsCount = 0;
+      }
+
+      // 入力
       const input = preprocessFromVideo(preview);
       const tensor = new ort.Tensor('float32', input, [1,3,IMG_H,IMG_W]);
+
+      // 推論
       const outputs = await session.run({ images: tensor });
       const vals = Object.values(outputs);
       const cell = outputs.cell_logits ?? vals[0];
       const look = outputs.look_logits ?? vals[1];
 
-      const cellLogits = Array.from(cell.data);
-      const lookLogits = Array.from(look.data);
+      // ロジット→確率（全クラス）
+      function toProbs(logits){
+        const max = Math.max(...logits);
+        const exps = logits.map(v=>Math.exp(v-max));
+        const sum = exps.reduce((a,b)=>a+b,0);
+        return exps.map(v=>v/sum);
+      }
+      let pCell = toProbs(Array.from(cell.data));
+      let pLook = toProbs(Array.from(look.data));
 
-      const [cellIdx] = top1(cellLogits);
-      const [lookIdx] = top1(lookLogits);
+      // スムージング
+      if (smoothToggle.checked){
+        if (!emaCell) emaCell = pCell.slice();
+        if (!emaLook) emaLook = pLook.slice();
+        for (let i=0;i<pCell.length;i++){
+          emaCell[i] = EMA_ALPHA*pCell[i] + (1-EMA_ALPHA)*emaCell[i];
+          emaLook[i] = EMA_ALPHA*pLook[i] + (1-EMA_ALPHA)*emaLook[i];
+        }
+        pCell = emaCell; pLook = emaLook;
+      }
 
-      const [gxC, gyC] = idxToCell[cellIdx] || ['?','?'];
-      const [gxL, gyL] = idxToCell[lookIdx] || ['?','?'];
+      // Top-K
+      const K = parseInt(topKSelect.value || '5', 10);
+      const idxC = [...pCell.keys()].sort((a,b)=> pCell[b]-pCell[a]).slice(0, K).map(i=>({i, p:pCell[i]}));
+      const idxL = [...pLook.keys()].sort((a,b)=> pLook[b]-pLook[a]).slice(0, K).map(i=>({i, p:pLook[i]}));
 
-      const pCell = softmax(cellLogits)[cellIdx];
-      const pLook = softmax(lookLogits)[lookIdx];
+      // 描画（Top-K）
+      renderTopK(topkCellEl, idxC, labelFromIndex);
+      renderTopK(topkLookEl, idxL, labelFromIndex);
 
+      // オーバレイ（Top1の簡易表示）
+      const bestC = idxC[0], bestL = idxL[0];
       overlayInfo.style.display = 'block';
       overlayInfo.innerHTML = `
-        <div><b>現在セル</b>: #${cellIdx} (gx=${gxC}, gy=${gyC})  <span class="hint">p=${pCell.toFixed(3)}</span></div>
-        <div><b>向き先セル</b>: #${lookIdx} (gx=${gxL}, gy=${gyL})  <span class="hint">p=${pLook.toFixed(3)}</span></div>
+        <div><b>現在セル</b>: ${labelFromIndex(bestC.i)} <span class="hint">p=${bestC.p.toFixed(3)}</span></div>
+        <div><b>向き先セル</b>: ${labelFromIndex(bestL.i)} <span class="hint">p=${bestL.p.toFixed(3)}</span></div>
       `;
     }
+
     function startInferLoop(){
       if (!session){ alert('モデルが読み込まれていません'); return; }
       if (!stream){ alert('先にカメラを開始してください'); return; }
       inferStatusEl.textContent = '推論中…';
       inferStartBtn.disabled = true; inferStopBtn.disabled = false;
-      inferTimer = setInterval(runOnce, 100); // 約10fps
+      // 約 ~10fps（必要なら 50–150ms で調整）
+      inferTimer = setInterval(runOnce, 100);
     }
     function stopInferLoop(){
       inferStartBtn.disabled = false; inferStopBtn.disabled = true;
       inferStatusEl.textContent = '停止中';
       if (inferTimer){ clearInterval(inferTimer); inferTimer=null; }
     }
+
     inferStartBtn.addEventListener('click', startInferLoop);
     inferStopBtn.addEventListener('click', stopInferLoop);
     stopBtn.addEventListener('click', stopInferLoop);
