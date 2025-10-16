@@ -3,20 +3,31 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>カメラ録画 + 推論（WebGPU / Top-K / FPS・IPS・Latency）</title>
+  <title>カメラ推論（WebGPU / Top-K / 横画面最適化）</title>
   <style>
     :root { --bg:#0f172a; --panel:#111827; --fg:#e5e7eb; --muted:#9ca3af; --accent:#38bdf8; }
     * { box-sizing: border-box; } html, body { height: 100%; }
-    body { margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial,"Noto Sans","Apple Color Emoji","Segoe UI Emoji"; background:var(--bg); color:var(--fg); }
-    .wrap { max-width: 960px; margin: 0 auto; padding: 20px; }
+    body { margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial,"Noto Sans","Apple Color Emoji","Segoe UI Emoji"; background:var(--bg); color: var(--fg); }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 16px; }
     header { display:flex; justify-content: space-between; align-items:center; gap:12px; flex-wrap:wrap; }
-    h1 { font-size: clamp(20px, 4.5vw, 28px); margin: 0; letter-spacing: .02em; }
+    h1 { font-size: clamp(18px, 3.8vw, 28px); margin: 0; letter-spacing: .02em; }
     .hint { color: var(--muted); font-size: 13px; }
     .panel { background: var(--panel); border: 1px solid #1f2937; border-radius: 16px; padding: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }
     .grid { display:grid; grid-template-columns: 1fr; gap:16px; }
-    @media (min-width: 900px){ .grid { grid-template-columns: 1.2fr .8fr; } }
 
-    video, .recorded { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 14px; overflow: hidden; display: block; object-fit: cover; }
+    /* --- 横画面最適化 --- */
+    @media (orientation: landscape){
+      .wrap { max-width: 1400px; padding: 20px; }
+      .grid { grid-template-columns: 1.6fr .9fr; gap:18px; }
+    }
+
+    /* 縦画面時は“横向きにしてください”ヒントを強調 */
+    .portrait-hint { display:none; margin:10px 0 0; font-size:12px; color:var(--muted); }
+    @media (orientation: portrait){
+      .portrait-hint { display:block; }
+    }
+
+    video { width: 100%; aspect-ratio: 16/9; background:#000; border-radius: 14px; overflow: hidden; display:block; object-fit: cover; }
     .controls { display:flex; flex-wrap: wrap; gap: 10px; align-items: center; }
     select, button, input[type="checkbox"] { font: inherit; }
     select, button { border-radius: 12px; border: 1px solid #334155; padding: 10px 14px; background: #0b1220; color: var(--fg); }
@@ -27,8 +38,6 @@
     .pill { padding: 6px 10px; border-radius: 999px; border:1px solid #334155; font-size: 12px; color: var(--muted); }
     .status { font-size: 13px; color: var(--muted); }
     .blink { animation: blink 1s steps(2, start) infinite; } @keyframes blink { to { visibility: hidden; } }
-    a.dl { display:inline-block; margin-top: 8px; color: white; text-decoration: none; border:1px solid #334155; border-radius: 10px; padding: 8px 12px; }
-    .note { font-size: 12px; color: var(--muted); line-height: 1.5; }
     .chip { display:inline-flex; align-items:center; gap:6px; background:#0b1220; border:1px solid #334155; border-radius:999px; padding:6px 10px; font-size:12px; }
     .overlay { position:absolute; top:10px; left:10px; background:rgba(0,0,0,.45); padding:8px 10px; border-radius:10px; font-size:12px; }
     .stack { position:relative; }
@@ -36,7 +45,7 @@
 
     /* Top-K 可視化 */
     .topk-item { display:flex; align-items:center; gap:8px; margin:6px 0; }
-    .topk-label { min-width: 140px; font-size: 12px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .topk-label { min-width: 150px; font-size: 12px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .prog { flex:1; height: 8px; background:#1f2937; border-radius:999px; overflow:hidden; }
     .prog > i { display:block; height:100%; width:0%; background: linear-gradient(90deg, #60a5fa, #22d3ee); }
     .topk-score { width:56px; text-align:right; font-variant-numeric: tabular-nums; color: var(--muted); font-size:12px; }
@@ -47,12 +56,14 @@
 <body>
   <div class="wrap">
     <header>
-      <h1>📹 カメラ録画 + 推論（WebGPU / Top-K 可視化）</h1>
+      <h1>📹 カメラ推論（WebGPU / Top-K 可視化）</h1>
       <div class="chip" title="接続は必ずHTTPSで">🔒 HTTPS 推奨</div>
     </header>
 
+    <p class="portrait-hint">※ スマホは <b>横向き</b> にするとUIが最適化されます。</p>
+
     <div class="grid">
-      <!-- 左：プレビュー -->
+      <!-- 左：プレビュー（撮影画面は残す） -->
       <section class="panel">
         <div class="row" style="justify-content: space-between;">
           <div class="row">
@@ -83,30 +94,15 @@
         <p class="status" id="status"></p>
       </section>
 
-      <!-- 右：録画 -->
+      <!-- 右：推論のみ（録画機能は削除） -->
       <section class="panel">
-        <h3 style="margin-top:0">🎞️ 録画</h3>
-        <div class="controls">
-          <button id="recBtn" disabled>録画開始</button>
-          <button id="stopRecBtn" class="danger" disabled>録画停止</button>
-          <span class="status" id="recStatus">待機中</span>
-        </div>
-        <video id="playback" class="recorded" controls playsinline></video>
-        <a id="download" class="dl" href="#" download style="display:none">保存する</a>
-        <p class="note">
-          iPhone / iPad は iOS 14.3+ で <code>MediaRecorder</code> が動作。Safari / iOS は <b>https</b> か <code>localhost</code> が必要。
-        </p>
-
-        <hr style="border-color:#334155">
-
-        <!-- 推論：自動ロード＆制御 -->
-        <h3 style="margin:6px 0 8px">🧠 推論（自動ロード）</h3>
+        <h3 style="margin-top:0">🧠 推論</h3>
         <div class="controls">
           <button id="inferStartBtn" disabled>推論開始</button>
           <button id="inferStopBtn" class="danger" disabled>推論停止</button>
           <span class="status" id="inferStatus">モデル読み込み中…</span>
         </div>
-        <ul class="note" style="margin-top:8px">
+        <ul class="hint" style="margin-top:8px">
           <li>読み込み先：<code>/models/multitask_web.onnx</code> / <code>/models/idx_to_cell.json</code></li>
           <li>バックエンド：WebGPU→WASMに自動フォールバック</li>
         </ul>
@@ -141,11 +137,12 @@
 
     <details style="margin-top:18px;" class="panel">
       <summary>トラブル対処のヒント</summary>
-      <ul class="note">
+      <ul class="hint">
         <li>トップが 404 → Vercel の Output Directory を見直し（<code>public</code> 推奨）。</li>
         <li>モデル 404 → <code>public/models/...</code> に配置＆パスは <code>/models/...</code>。</li>
         <li>WebGPU不可 → 自動で WASM にフォールバック（速度は低下）。</li>
         <li>自動再生されない → いずれかのボタンを押してジェスチャーを発生。</li>
+        <li>スマホは横向きで利用してください（縦向き時はUIが簡略表示）。</li>
       </ul>
     </details>
   </div>
@@ -161,91 +158,58 @@
       ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
     } catch {}
 
-    // ================== 既存のカメラ/録画部分 ==================
+    // ================== カメラ周り（録画関連は削除） ==================
     const preview = document.getElementById('preview');
-    const playback = document.getElementById('playback');
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
-    const recBtn = document.getElementById('recBtn');
-    const stopRecBtn = document.getElementById('stopRecBtn');
     const statusEl = document.getElementById('status');
-    const recStatusEl = document.getElementById('recStatus');
     const cameraSelect = document.getElementById('cameraSelect');
     const micToggle = document.getElementById('micToggle');
     const hdToggle = document.getElementById('hdToggle');
-    const downloadLink = document.getElementById('download');
     const overlayInfo = document.getElementById('overlayInfo');
     const backendLabel = document.getElementById('backendLabel');
 
-    let stream = null, recorder = null, chunks = [], chosenMime = '';
+    let stream = null;
 
-    function pickMimeType(){
-      const candidates = [
-        'video/mp4;codecs=h264,aac','video/mp4;codecs=avc1',
-        'video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'
-      ];
-      for (const m of candidates){
-        if (window.MediaRecorder?.isTypeSupported?.(m)) return m;
-      }
-      return '';
+    function pickFacingConstraint(){
+      const facing = cameraSelect.value;
+      if (facing==='environment') return {ideal:'environment'};
+      if (facing==='user') return {ideal:'user'};
+      return undefined; // auto
     }
+
     async function startCamera(){
       try{
         stopCamera();
-        const facing = cameraSelect.value, useMic = micToggle.checked, hd = hdToggle.checked;
+        const useMic = micToggle.checked, hd = hdToggle.checked;
         const videoConstraints = {
           width: hd ? {ideal:1920}:{ideal:1280}, height: hd ? {ideal:1080}:{ideal:720},
-          frameRate:{ideal:30,max:60}
+          frameRate:{ideal:30,max:60},
+          facingMode: pickFacingConstraint()
         };
-        if (facing==='environment') videoConstraints.facingMode = {ideal:'environment'};
-        else if (facing==='user')   videoConstraints.facingMode = {ideal:'user'};
         stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: useMic });
         preview.srcObject = stream; await preview.play();
         statusEl.textContent = 'カメラ起動中';
-        startBtn.disabled = true; stopBtn.disabled = false; recBtn.disabled = false;
+        startBtn.disabled = true; stopBtn.disabled = false;
       }catch(err){
         console.error(err);
         statusEl.textContent = 'カメラ開始失敗：' + (err.message || err.name);
-        startBtn.disabled=false; stopBtn.disabled=true; recBtn.disabled=true;
+        startBtn.disabled=false; stopBtn.disabled=true;
       }
     }
     function stopCamera(){
       if (stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
       preview.srcObject=null;
-      startBtn.disabled=false; stopBtn.disabled=true; recBtn.disabled=true;
+      startBtn.disabled=false; stopBtn.disabled=true;
       statusEl.textContent='停止中';
     }
-    function startRecording(){
-      if (!stream){ alert('先にカメラを開始してください'); return; }
-      chunks=[]; chosenMime = pickMimeType();
-      try{ recorder = new MediaRecorder(stream, chosenMime?{mimeType:chosenMime}:undefined); }
-      catch(e){ alert('録画非対応ブラウザの可能性'); return; }
-      recorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
-      recorder.onstop = handleRecordingStop;
-      recorder.start();
-      recBtn.disabled=true; stopRecBtn.disabled=false; recStatusEl.textContent='録画中…'; recStatusEl.classList.add('blink');
-    }
-    function stopRecording(){
-      if (recorder && recorder.state!=='inactive') recorder.stop();
-      stopRecBtn.disabled=true; recBtn.disabled=false; recStatusEl.textContent='処理中…';
-    }
-    function handleRecordingStop(){
-      const blob = new Blob(chunks, {type: chosenMime || 'video/webm'});
-      const url = URL.createObjectURL(blob);
-      playback.src=url; playback.load(); playback.play();
-      const ext = (chosenMime && chosenMime.includes('mp4')) ? 'mp4' : 'webm';
-      const stamp = new Date().toISOString().replace(/[:.]/g,'-');
-      downloadLink.href=url; downloadLink.download=`recording-${stamp}.${ext}`; downloadLink.style.display='inline-block';
-      recStatusEl.textContent='録画完了'; recStatusEl.classList.remove('blink');
-    }
+
     startBtn.addEventListener('click', startCamera);
     stopBtn.addEventListener('click', stopCamera);
-    recBtn.addEventListener('click', startRecording);
-    stopRecBtn.addEventListener('click', stopRecording);
     [cameraSelect, micToggle, hdToggle].forEach(el=>el.addEventListener('change', ()=>{
       if (stream) statusEl.textContent='設定変更→再度「カメラ開始」を押してください。';
     }));
-    preview.setAttribute('playsinline','true'); playback.setAttribute('playsinline','true');
+    preview.setAttribute('playsinline','true');
     if (!navigator.mediaDevices?.getUserMedia){
       statusEl.textContent='このブラウザはカメラアクセス非対応です。'; startBtn.disabled=true;
     }
@@ -283,12 +247,6 @@
     }
 
     // ---------- 可視化ユーティリティ ----------
-    function softmax(logits){
-      const max = Math.max(...logits);
-      const exps = logits.map(v=>Math.exp(v - max));
-      const sum = exps.reduce((a,b)=>a+b,0);
-      return exps.map(v=>v/sum);
-    }
     function renderTopK(containerEl, items, labelFromIndex){
       containerEl.innerHTML = '';
       for (const {i, p} of items){
